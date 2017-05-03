@@ -7,21 +7,15 @@
 #include "soc/gpio_struct.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_heap_alloc_caps.h"
 
 #include "ili9341.h"
 
 
-#define PIN_NUM_MISO 25
-#define PIN_NUM_MOSI 23
-#define PIN_NUM_CLK  19
-#define PIN_NUM_CS   22
-
-#define PIN_NUM_DC   21
-#define PIN_NUM_RST  18
-#define PIN_NUM_BCKL 5
+#define CHUNK_SIZE 1024
 
 
-static const char* TAG = "ili9341";
+static const char *TAG = "ili9341";
 
 
 /*
@@ -40,7 +34,7 @@ typedef struct {
     uint8_t databytes; //No of data in data; bit 7 = delay after set; 0xFF = end of cmds.
 } ili_init_cmd_t;
 
-static const ili_init_cmd_t ili_init_cmds[]={
+static const ili_init_cmd_t ili_init_cmds_drom[]={
     {0xCF, {0x00, 0x83, 0X30}, 3},
     {0xED, {0x64, 0x03, 0X12, 0X81}, 4},
     {0xE8, {0x85, 0x01, 0x79}, 3},
@@ -59,7 +53,7 @@ static const ili_init_cmd_t ili_init_cmds[]={
     {0xE0, {0x1F, 0x1A, 0x18, 0x0A, 0x0F, 0x06, 0x45, 0X87, 0x32, 0x0A, 0x07, 0x02, 0x07, 0x05, 0x00}, 15},
     {0XE1, {0x00, 0x25, 0x27, 0x05, 0x10, 0x09, 0x3A, 0x78, 0x4D, 0x05, 0x18, 0x0D, 0x38, 0x3A, 0x1F}, 15},
     {0x2A, {0x00, 0x00, 0x00, 0xEF}, 4},
-    {0x2B, {0x00, 0x00, 0x01, 0x3f}, 4}, 
+    {0x2B, {0x00, 0x00, 0x01, 0x3f}, 4},
     {0x2C, {0}, 0},
     {0xB7, {0x07}, 1},
     {0xB6, {0x0A, 0x82, 0x27, 0x00}, 4},
@@ -69,169 +63,267 @@ static const ili_init_cmd_t ili_init_cmds[]={
 };
 
 typedef struct {
-    uint8_t dc;
-    uint8_t free_buffer;
-    void * buffer;
+    void *buffer1, *buffer2, *user;
+    ili_draw_cb_t finish_cb;
+} ili_draw_finish_handle_t;
+
+typedef struct {
+    bool dc;
+    uint8_t dc_io_num;
+    ili_draw_finish_handle_t *finish_handle;
 } spi_transaction_user_data_t;
 
 //Send a command to the ILI9341. Uses spi_device_transmit, which waits until the transfer is complete.
-void ili_cmd(spi_device_handle_t spi, const uint8_t cmd) 
+void ili_cmd(ili_device_handle_t ili, const uint8_t cmd)
 {
     esp_err_t ret;
-    spi_transaction_t t;
+    spi_transaction_t *t = pvPortMallocCaps(sizeof(spi_transaction_t), MALLOC_CAP_DMA);
+    assert(t);
     spi_transaction_user_data_t u;
-    memset(&t, 0, sizeof(t));       //Zero out the transaction
+    memset(t, 0, sizeof(spi_transaction_t));       //Zero out the transaction
     memset(&u, 0, sizeof(u));       //Zero out the transaction
-    t.length=8;                     //Command is 8 bits
-    t.tx_buffer=&cmd;               //The data is the cmd itself
-    t.user=&u;
-    u.dc=0;                         //D/C needs to be set to 0
-    ret=spi_device_transmit(spi, &t);  //Transmit!
+    t->length=8;                     //Command is 8 bits
+    t->tx_buffer=&cmd;               //The data is the cmd itself
+    t->user=&u;
+    u.dc=false;                         //D/C needs to be set to 0
+    u.dc_io_num = ili->dc_io_num;
+    ret=spi_device_transmit(ili->spi, t);  //Transmit!
     assert(ret==ESP_OK);            //Should have had no issues.
+    free(t);
 }
 
 //Send data to the ILI9341. Uses spi_device_transmit, which waits until the transfer is complete.
-void ili_data(spi_device_handle_t spi, const uint8_t *data, int len) 
+void ili_data(ili_device_handle_t ili, const uint8_t *data, int len)
 {
     esp_err_t ret;
-    spi_transaction_t t;
+    spi_transaction_t *t = pvPortMallocCaps(sizeof(spi_transaction_t), MALLOC_CAP_DMA);
+    assert(t);
+    spi_transaction_user_data_t u;
     if (len==0) return;             //no need to send anything
-    memset(&t, 0, sizeof(t));       //Zero out the transaction
-    t.length=len*8;                 //Len is in bytes, transaction length is in bits.
-    t.tx_buffer=data;               //Data
-    t.user=NULL;                    //D/C needs to be set to 0
-    ret=spi_device_transmit(spi, &t);  //Transmit!
+    memset(t, 0, sizeof(spi_transaction_t));       //Zero out the transaction
+    t->length=len*8;                 //Len is in bytes, transaction length is in bits.
+    t->tx_buffer=data;               //Data
+    t->user=&u;
+    u.dc=true;
+    u.dc_io_num = ili->dc_io_num;
+    ret=spi_device_transmit(ili->spi, t);  //Transmit!
     assert(ret==ESP_OK);            //Should have had no issues.
+    free(t);
 }
 
 //This function is called (in irq context!) just before a transmission starts. It will
 //set the D/C line to the value indicated in the user field.
-void ili_spi_pre_transfer_callback(spi_transaction_t *t) 
+void ili_spi_pre_transfer_callback(spi_transaction_t *t)
 {
-    if ( t->user == NULL || ((spi_transaction_user_data_t*)t->user)->dc == 1 ) gpio_set_level(PIN_NUM_DC, 1);
-    else gpio_set_level(PIN_NUM_DC, 0);
+    if ( ((spi_transaction_user_data_t*)t->user)->dc )
+        gpio_set_level(((spi_transaction_user_data_t*)t->user)->dc_io_num, 1);
+    else
+        gpio_set_level(((spi_transaction_user_data_t*)t->user)->dc_io_num, 0);
+}
+
+esp_err_t ili_bus_add_device(spi_host_device_t host, ili_config_t *dev_config, ili_device_handle_t *handle)
+{
+    esp_err_t ret;
+    spi_device_handle_t spi;
+
+    //TODO: check return code
+    ili_device_t *dev = malloc(sizeof(ili_device_t));
+
+    dev->dc_io_num = dev_config->dc_io_num;
+    dev->reset_io_num = dev_config->reset_io_num;
+    dev->bckl_io_num = dev_config->bckl_io_num;
+
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = 10000000,               //Clock out at 10 MHz
+        .mode = 0,                                //SPI mode 0
+        .spics_io_num = dev_config->spics_io_num, //CS pin
+        .queue_size = 64,
+        .pre_cb = ili_spi_pre_transfer_callback,  //Specify pre-transfer callback to handle D/C line
+    };
+
+    //Attach the LCD to the SPI bus
+    ret = spi_bus_add_device(host, &devcfg, &spi);
+    if ( ret != ESP_OK ){
+        free(dev);
+        return ret;
+    }
+
+    //TODO: check return code
+    xTaskCreate(ili_result_task, "ili_result_task", 4096, (void*)dev, 0, NULL);
+
+    dev->spi = spi;
+    *handle = dev;
+    return ret;
 }
 
 //Initialize the display
-void ili_init(spi_device_handle_t spi) 
+esp_err_t ili_init(ili_device_handle_t ili)
 {
-    int cmd=0;
+    ili_init_cmd_t *ili_init_cmds = pvPortMallocCaps(sizeof(ili_init_cmds_drom), MALLOC_CAP_DMA);
+    if ( !ili_init_cmds ) return ESP_ERR_NO_MEM;
+    memcpy(ili_init_cmds, ili_init_cmds_drom, sizeof(ili_init_cmds_drom));
+
+    int cmd = 0;
     //Initialize non-SPI GPIOs
-    gpio_set_direction(PIN_NUM_DC, GPIO_MODE_OUTPUT);
-    gpio_set_direction(PIN_NUM_RST, GPIO_MODE_OUTPUT);
-    gpio_set_direction(PIN_NUM_BCKL, GPIO_MODE_OUTPUT);
+    gpio_set_direction(ili->dc_io_num, GPIO_MODE_OUTPUT);
+    gpio_set_direction(ili->reset_io_num, GPIO_MODE_OUTPUT);
+    gpio_set_direction(ili->bckl_io_num, GPIO_MODE_OUTPUT);
 
     //Reset the display
-    gpio_set_level(PIN_NUM_RST, 0);
+    gpio_set_level(ili->reset_io_num, 0);
     vTaskDelay(100 / portTICK_RATE_MS);
-    gpio_set_level(PIN_NUM_RST, 1);
+    gpio_set_level(ili->reset_io_num, 1);
     vTaskDelay(100 / portTICK_RATE_MS);
 
     //Send all the commands
     while (ili_init_cmds[cmd].databytes!=0xff) {
-        ili_cmd(spi, ili_init_cmds[cmd].cmd);
-        ili_data(spi, ili_init_cmds[cmd].data, ili_init_cmds[cmd].databytes&0x1F);
+        ili_cmd(ili, ili_init_cmds[cmd].cmd);
+        ili_data(ili, ili_init_cmds[cmd].data, ili_init_cmds[cmd].databytes&0x1F);
         if (ili_init_cmds[cmd].databytes&0x80) {
             vTaskDelay(100 / portTICK_RATE_MS);
         }
         cmd++;
     }
 
+    free(ili_init_cmds);
+
     ///Enable backlight
-    gpio_set_level(PIN_NUM_BCKL, 0);
+    gpio_set_level(ili->bckl_io_num, 0);
+
+    return ESP_OK;
 }
 
 
-void ili_draw_bitmap(spi_device_handle_t spi, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t * bitmap, int free_buffer)
+esp_err_t ili_draw_bitmap(ili_device_handle_t ili, uint16_t x, uint16_t y,
+    uint16_t w, uint16_t h, uint16_t *bitmap, ili_draw_cb_t finish_cb, void *user)
 {
-    esp_err_t ret;
     int i;
+    esp_err_t ret;
+
     int pixel = w * h;
-    int remain = pixel % 1024;
-    int chunks = (pixel - 1) / 1024 + 1;
+    int remain = pixel % CHUNK_SIZE;
+    int chunks = pixel / CHUNK_SIZE + ( remain ? 1 : 0 );
 
     ESP_LOGD(TAG, "bitmap address: 0x%08x", (unsigned int)bitmap);
     ESP_LOGD(TAG, "pixel: %d, chunks: %d, remain: %d", pixel, chunks, remain);
 
-    spi_transaction_t * trans = calloc(5 + chunks, sizeof(spi_transaction_t));
+    spi_transaction_t *trans = pvPortMallocCaps((chunks + 5) * sizeof(spi_transaction_t), MALLOC_CAP_DMA);
+    spi_transaction_user_data_t *userdata = calloc(3, sizeof(spi_transaction_user_data_t));
+    ili_draw_finish_handle_t *finish_handle = calloc(1, sizeof(ili_draw_finish_handle_t));
+
+    if ( !(trans && userdata && finish_handle) ) {
+        free(trans);
+        free(userdata);
+        free(finish_handle);
+        return ESP_ERR_NO_MEM;
+    }
+
     ESP_LOGD(TAG, "calloc'ed trans: 0x%08x", (unsigned int)trans);
-    assert(trans);
-
-    spi_transaction_user_data_t * userdata = calloc(4, sizeof(spi_transaction_user_data_t));
     ESP_LOGD(TAG, "calloc'ed userdata: 0x%08x", (unsigned int)userdata);
-    assert(userdata);
+    ESP_LOGD(TAG, "calloc'ed finish_handle: 0x%08x", (unsigned int)finish_handle);
 
-    trans[0].length=8;
-    trans[0].user=(void*)&userdata[0];
-    trans[0].flags=SPI_TRANS_USE_TXDATA;
+    memset(trans, 0, (chunks + 5) * sizeof(spi_transaction_t));       //Zero out the transaction
+
+    finish_handle->buffer1 = (void*)trans;
+    finish_handle->buffer2 = (void*)userdata;
+    finish_handle->user = user;
+    finish_handle->finish_cb = finish_cb;
+
+    for (i = 0; i < 3; i++) {
+        userdata[i].dc_io_num = ili->dc_io_num;
+        if ( i ) userdata[i].dc = true;
+    }
+
+    userdata[2].finish_handle = finish_handle;
+
+    for (i = 0; i < 5; i++) {
+        if ( ! (i & 1) ) {
+            trans[i].length = 8;
+            trans[i].user = (void*)&userdata[0];
+        }
+        else {
+            trans[i].length = 8 * 4;
+            trans[i].user = (void*)&userdata[1];
+        }
+        trans[i].flags = SPI_TRANS_USE_TXDATA;
+    }
+
     trans[0].tx_data[0]=0x2A;           //Column Address Set
-    userdata[0].dc=0;
 
-    trans[1].length=8*4;
-    trans[1].user=NULL;
-    trans[1].flags=SPI_TRANS_USE_TXDATA;
     trans[1].tx_data[0]=x>>8;           //Start Col High
     trans[1].tx_data[1]=x&0xff;         //Start Col Low
     trans[1].tx_data[2]=(x+w-1)>>8;     //End Col High
     trans[1].tx_data[3]=(x+w-1)&0xff;   //End Col Low
 
-    trans[2].length=8;
-    trans[2].user=(void*)&userdata[1];
-    trans[2].flags=SPI_TRANS_USE_TXDATA;
     trans[2].tx_data[0]=0x2B;           //Page address set
-    userdata[1].dc=0;
 
-    trans[3].length=8*4;
-    trans[3].user=NULL;
-    trans[3].flags=SPI_TRANS_USE_TXDATA;
     trans[3].tx_data[0]=y>>8;           //Start page high
     trans[3].tx_data[1]=y&0xff;         //start page low
     trans[3].tx_data[2]=(y+h-1)>>8;     //end page high
     trans[3].tx_data[3]=(y+h-1)&0xff;   //end page low
 
-    trans[4].length=8;
-    trans[4].flags=SPI_TRANS_USE_TXDATA;
-    trans[4].user=(void*)&userdata[2];
     trans[4].tx_data[0]=0x2C;           //memory write
-    userdata[2].dc=0;
 
-    trans[4+chunks].user=(void*)&userdata[3];
-    userdata[3].dc=1;
-    userdata[3].free_buffer=free_buffer;
-    userdata[3].buffer=(void*)bitmap;
-
-    for (i=0; i<5; i++)
-    {
-        ESP_LOGD(TAG, "transmitting command and address: %d", i);
-        ret=spi_device_queue_trans(spi, &trans[i], portMAX_DELAY);
-        assert(ret==ESP_OK);
+    for (i = 0; i < chunks; i++) {
+        trans[i + 5].tx_buffer = bitmap + CHUNK_SIZE * i;
+        trans[i + 5].length = CHUNK_SIZE * 16;
+        trans[i + 5].user = (void*)&userdata[1];
     }
 
-    for (i=0; i<chunks; i++)
-    {
-        trans[5+i].tx_buffer=bitmap+1024*i;
-        if ( i*1024 < pixel ) trans[5+i].length=16384;
-        else trans[5+i].length=16*remain;
-        ret=spi_device_queue_trans(spi, &trans[5+i], portMAX_DELAY);
-        assert(ret==ESP_OK);
-    }
+    if ( remain ) trans[chunks + 4].length = remain * 16;
 
+    trans[chunks + 4].user = (void*)&userdata[2];
+
+    for (i = 0; i < chunks + 5; i++) {
+        ret = spi_device_queue_trans(ili->spi, &trans[i], portMAX_DELAY);
+        if ( ret != ESP_OK ) return ret;
+    }
+    return ESP_OK;
 }
 
 
-void send_line_finish(spi_device_handle_t spi) 
+void ili_result_task(void *pvParameter)
 {
+    ili_device_handle_t ili = (ili_device_handle_t)pvParameter;
     spi_transaction_t *rtrans;
+    ili_draw_cb_t finish_cb;
+    void *user;
     esp_err_t ret;
 
     for (;;) {
-        ret=spi_device_get_trans_result(spi, &rtrans, portMAX_DELAY);
+        ret = spi_device_get_trans_result(ili->spi, &rtrans, portMAX_DELAY);
         assert(ret==ESP_OK);
 
-        if ( rtrans->user && ((spi_transaction_user_data_t*)rtrans->user)->free_buffer )
+        if ( rtrans->user )
         {
-            ESP_LOGD(TAG, "free'ing buffer: 0x%08x", (unsigned int)((spi_transaction_user_data_t*)rtrans->user)->buffer);
-            free(((spi_transaction_user_data_t*)rtrans->user)->buffer);
+            ESP_LOGD(TAG, "spi_device_get_trans_result, user: 0x%08x, finish_handle: 0x%08x",
+                (unsigned int)((spi_transaction_user_data_t*)rtrans->user),
+                (unsigned int)((spi_transaction_user_data_t*)rtrans->user)->finish_handle);
+        }
+        else
+        {
+            ESP_LOGD(TAG, "spi_device_get_trans_result, user: 0x%08x",
+                (unsigned int)((spi_transaction_user_data_t*)rtrans->user));
+        }
+
+        if ( rtrans->user && ((spi_transaction_user_data_t*)rtrans->user)->finish_handle )
+        {
+            finish_cb = ((spi_transaction_user_data_t*)rtrans->user)->finish_handle->finish_cb;
+            user = ((spi_transaction_user_data_t*)rtrans->user)->finish_handle->user;
+
+            ESP_LOGD(TAG, "free'ing buffer1: 0x%08x",
+                (unsigned int)((spi_transaction_user_data_t*)rtrans->user)->finish_handle->buffer1);
+            free(((spi_transaction_user_data_t*)rtrans->user)->finish_handle->buffer1);
+
+            ESP_LOGD(TAG, "free'ing buffer2: 0x%08x",
+                (unsigned int)((spi_transaction_user_data_t*)rtrans->user)->finish_handle->buffer2);
+            free(((spi_transaction_user_data_t*)rtrans->user)->finish_handle->buffer2);
+
+            ESP_LOGD(TAG, "free'ing finish_handle: 0x%08x",
+                (unsigned int)((spi_transaction_user_data_t*)rtrans->user)->finish_handle);
+            free(((spi_transaction_user_data_t*)rtrans->user)->finish_handle);
+
+            if ( finish_cb ) (finish_cb)(user);
         }
     }
 }
